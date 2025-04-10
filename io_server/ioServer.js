@@ -204,55 +204,125 @@ app.post('/uploadMap', upload.fields([
     }
 });
 
-/* ──────────────────────────────────────────────────────────
-   2. AMR Push API  (포트 19301)
-────────────────────────────────────────────────────────── */
 
+/* ───────────────────────────────
+   2. AMR Push API 클라이언트
+───────────────────────────────*/
+const PUSH_PORT = 19301;
 const robotLastReceived = new Map();
-const pushServer = net.createServer(socket => {
+
+/* ── 헤더 파서 ───────────────── */
+function parseHeader(buf) {
+    return {
+        sync: buf.readUInt8(0),
+        ver: buf.readUInt8(1),
+        serial: buf.readUInt16BE(2),
+        len: buf.readUInt32BE(4),
+        type: buf.readUInt16BE(8)
+    };
+}
+
+/* ── 로봇 한 대와 구독 세션 만들기 ─ */
+function subscribePush(amrIp) {
+    const socket = new net.Socket();
     let buffer = Buffer.alloc(0);
-    socket.on('data', async chunk => {
+
+    socket.setTimeout(10_000);
+
+    socket.connect(PUSH_PORT, amrIp, () =>
+        console.log(`[Push] connected to ${amrIp}:${PUSH_PORT}`)
+    );
+
+    socket.on("data", async (chunk) => {
         buffer = Buffer.concat([buffer, chunk]);
+
         while (buffer.length >= 16) {
-            if (buffer.readUInt8(0) !== 0x5A) { socket.destroy(); return; }
-            const len = buffer.readUInt32BE(4);
-            if (buffer.length < 16 + len) break;
-            const pkt = buffer.slice(0, 16 + len);
-            buffer = buffer.slice(16 + len);
+            if (buffer.readUInt8(0) !== 0x5A) {
+                console.warn("[Push] bad sync byte, drop");
+                buffer = Buffer.alloc(0);
+                break;
+            }
+            const header = parseHeader(buffer.slice(0, 16));
+            if (buffer.length < 16 + header.len) break; // not full packet yet
 
-            let json; try { json = JSON.parse(pkt.slice(16).toString()); } catch { continue; }
-
-            const name = json.vehicle_id || json.robot_id || 'UnknownRobot';
-            robotLastReceived.set(name, Date.now());
-            const pos = { x: json.x ?? json.position?.x ?? 0, y: json.y ?? json.position?.y ?? 0, angle: json.angle ?? json.position?.yaw ?? 0 };
+            const packet = buffer.slice(0, 16 + header.len);
+            buffer = buffer.slice(16 + header.len);
 
             try {
+                const json = JSON.parse(packet.slice(16).toString());
+                const name =
+                    json.vehicle_id || json.robot_id || "UnknownRobot";
+
+                /* 수신 타임스탬프 기록 */
+                robotLastReceived.set(name, Date.now());
+
+                /* 위치·상태 DB 업데이트 */
+                const pos = {
+                    x: json.x ?? json.position?.x ?? 0,
+                    y: json.y ?? json.position?.y ?? 0,
+                    angle: json.angle ?? json.position?.yaw ?? 0,
+                };
                 await axios.post(`${CORE_URL}/api/robots`, {
-                    name, status: json.status,
+                    name,
+                    status: json.status,
                     position: JSON.stringify(pos),
                     additional_info: JSON.stringify(json),
                     timestamp: new Date(),
-                    ip: socket.remoteAddress,
+                    ip: amrIp,
                 });
-            } catch (e) { console.error('[Push] forward error:', e.message); }
+            } catch (e) {
+                console.error("[Push] JSON parse error:", e.message);
+            }
         }
     });
-});
-pushServer.listen(19301, () => console.log('TCP Push server 19301'));
 
+    socket.on("error", (e) => {
+        console.error(`[Push] socket error (${amrIp}):`, e.message);
+        retry();
+    });
+
+    socket.on("close", () => {
+        console.warn(`[Push] connection closed (${amrIp})`);
+        retry();
+    });
+
+    socket.on("timeout", () => {
+        console.warn(`[Push] timeout (${amrIp})`);
+        socket.destroy();
+    });
+
+    /* 재연결 로직 */
+    function retry() {
+        setTimeout(() => subscribePush(amrIp), 5_000);
+    }
+}
+
+/* ── AMR IP 목록(여러 대면 배열) ─ */
+const AMR_IPS = (process.env.AMR_IPS || "192.168.0.100")
+    .split(",")
+    .map((s) => s.trim());
+
+AMR_IPS.forEach(subscribePush);
+
+/* ── “연결 끊김” 감지 타이머 ─ */
 setInterval(async () => {
     const now = Date.now();
-    for (const [name, t] of robotLastReceived.entries()) {
-        if (now - t > 5000) {
+    for (const [name, last] of robotLastReceived) {
+        if (now - last > 5_000) {
             robotLastReceived.delete(name);
             try {
                 await axios.post(`${CORE_URL}/api/robots`, {
-                    name, status: '연결 끊김', timestamp: new Date()
+                    name,
+                    status: "연결 끊김",
+                    timestamp: new Date(),
                 });
-            } catch (e) { console.error('[Push] disconnect update error:', e.message); }
+            } catch (e) {
+                console.error("[Push] disconnect update error:", e.message);
+            }
         }
     }
-}, 1000);
+}, 1_000);
+
 
 /* ──────────────────────────────────────────────────────────
    3. /api/sendTask  ― Core → ioServer
