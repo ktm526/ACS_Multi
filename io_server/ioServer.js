@@ -15,7 +15,9 @@ const yaml = require('js-yaml');
 const app = express();
 
 /* ───── 환경 상수 ───────────────────────────────────────── */
-const AMR_IP = process.env.AMR_IP || '192.168.0.100'; // 기본 AMR IP
+const AMR_IP = process.env.AMR_IP || '192.168.45.174'; // 기본 AMR IP
+const AMR_IPS = (process.env.AMR_IPS || AMR_IP).split(',').map(s => s.trim());
+
 const CORE_URL = process.env.CORE_URL || 'http://localhost:3000';
 const CMD_PORT = 19304;                                 // 단순 명령 포트
 const NAV_PORT = 19206;                                 // Navigation API 포트
@@ -25,6 +27,7 @@ const MSG_GOTARGET_RES = 0x32FB;  // 13051 robot_task_gotarget_res
 let serialCounter = 1;
 const MAP_REQ_ID = 0x0514;   // 1300
 const MAP_RES_ID = 0x2C24;   // 11300
+const PUSH_PORT = 19301;
 
 /* ───── 공통 미들웨어 ──────────────────────────────────── */
 app.use(cors());
@@ -204,14 +207,15 @@ app.post('/uploadMap', upload.fields([
     }
 });
 
+/* ──────────────────────────────────────────────────────────
+   2.  AMR Push API 클라이언트
+   - 19301 포트로 들어오는 로봇 Push 데이터 수신
+   - 위치·상태 업데이트 + task_status 처리
+────────────────────────────────────────────────────────── */
 
-/* ───────────────────────────────
-   2. AMR Push API 클라이언트
-───────────────────────────────*/
-const PUSH_PORT = 19301;
-const robotLastReceived = new Map();
+const robotLastReceived = new Map();         // name -> timestamp(ms)
+const robotSessions = new Map();         // 진행중 세션(name -> {socket,route,idx,taskId,robotName})
 
-/* ── 헤더 파서 ───────────────── */
 function parseHeader(buf) {
     return {
         sync: buf.readUInt8(0),
@@ -222,112 +226,7 @@ function parseHeader(buf) {
     };
 }
 
-/* ── 로봇 한 대와 구독 세션 만들기 ─ */
-function subscribePush(amrIp) {
-    const socket = new net.Socket();
-    let buffer = Buffer.alloc(0);
-
-    socket.setTimeout(10_000);
-
-    socket.connect(PUSH_PORT, amrIp, () =>
-        console.log(`[Push] connected to ${amrIp}:${PUSH_PORT}`)
-    );
-
-    socket.on("data", async (chunk) => {
-        buffer = Buffer.concat([buffer, chunk]);
-
-        while (buffer.length >= 16) {
-            if (buffer.readUInt8(0) !== 0x5A) {
-                console.warn("[Push] bad sync byte, drop");
-                buffer = Buffer.alloc(0);
-                break;
-            }
-            const header = parseHeader(buffer.slice(0, 16));
-            if (buffer.length < 16 + header.len) break; // not full packet yet
-
-            const packet = buffer.slice(0, 16 + header.len);
-            buffer = buffer.slice(16 + header.len);
-
-            try {
-                const json = JSON.parse(packet.slice(16).toString());
-                const name =
-                    json.vehicle_id || json.robot_id || "UnknownRobot";
-
-                /* 수신 타임스탬프 기록 */
-                robotLastReceived.set(name, Date.now());
-
-                /* 위치·상태 DB 업데이트 */
-                const pos = {
-                    x: json.x ?? json.position?.x ?? 0,
-                    y: json.y ?? json.position?.y ?? 0,
-                    angle: json.angle ?? json.position?.yaw ?? 0,
-                };
-                await axios.post(`${CORE_URL}/api/robots`, {
-                    name,
-                    status: json.status,
-                    position: JSON.stringify(pos),
-                    additional_info: JSON.stringify(json),
-                    timestamp: new Date(),
-                    ip: amrIp,
-                });
-            } catch (e) {
-                console.error("[Push] JSON parse error:", e.message);
-            }
-        }
-    });
-
-    socket.on("error", (e) => {
-        console.error(`[Push] socket error (${amrIp}):`, e.message);
-        retry();
-    });
-
-    socket.on("close", () => {
-        console.warn(`[Push] connection closed (${amrIp})`);
-        retry();
-    });
-
-    socket.on("timeout", () => {
-        console.warn(`[Push] timeout (${amrIp})`);
-        socket.destroy();
-    });
-
-    /* 재연결 로직 */
-    function retry() {
-        setTimeout(() => subscribePush(amrIp), 5_000);
-    }
-}
-
-/* ── AMR IP 목록(여러 대면 배열) ─ */
-const AMR_IPS = (process.env.AMR_IPS || "192.168.0.100")
-    .split(",")
-    .map((s) => s.trim());
-
-AMR_IPS.forEach(subscribePush);
-
-/* ── “연결 끊김” 감지 타이머 ─ */
-setInterval(async () => {
-    const now = Date.now();
-    for (const [name, last] of robotLastReceived) {
-        if (now - last > 5_000) {
-            robotLastReceived.delete(name);
-            try {
-                await axios.post(`${CORE_URL}/api/robots`, {
-                    name,
-                    status: "연결 끊김",
-                    timestamp: new Date(),
-                });
-            } catch (e) {
-                console.error("[Push] disconnect update error:", e.message);
-            }
-        }
-    }
-}, 1_000);
-
-
-/* ──────────────────────────────────────────────────────────
-   3. /api/sendTask  ― Core → ioServer
-────────────────────────────────────────────────────────── */
-
+/* ── 목적지 전송 헬퍼 ───────────────────────────── */
 function buildPacket(type, json, serial) {
     const body = Buffer.from(JSON.stringify(json), 'utf8');
     const head = Buffer.alloc(16);
@@ -338,100 +237,186 @@ function buildPacket(type, json, serial) {
     head.writeUInt16BE(type, 8);
     return Buffer.concat([head, body]);
 }
-function parseHeader(buf) { return { len: buf.readUInt32BE(4), type: buf.readUInt16BE(8) }; }
+function sendGoto(sock, dest, prev, taskId) {
+    const serial = serialCounter = (serialCounter + 1) & 0xFFFF;
+    const payload = {
+        id: dest,
+        source_id: prev ?? 'SELF_POSITION',
+        task_id: String(taskId),
+        method: 'forward',
+        skill_name: 'GotoSpecifiedPose'
+    };
+    sock.write(buildPacket(MSG_GOTARGET_ID, payload, serial));
+}
+
+/* ── Push 세션 구독 (AMR IP 배열 지원) ───────────── */
+function subscribePush(ip) {
+    const sock = new net.Socket();
+    let buffer = Buffer.alloc(0);
+
+    sock.setTimeout(10_000);
+    sock.connect(PUSH_PORT, ip, () => console.log(`[Push] connected ${ip}:${PUSH_PORT}`));
+
+    sock.on('data', async chunk => {
+        buffer = Buffer.concat([buffer, chunk]);
+
+        while (buffer.length >= 16) {
+            if (buffer.readUInt8(0) !== 0x5A) { buffer = Buffer.alloc(0); break; }
+            const h = parseHeader(buffer.slice(0, 16));
+            if (buffer.length < 16 + h.len) break;
+
+            const pkt = buffer.slice(0, 16 + h.len);
+            buffer = buffer.slice(16 + h.len);
+
+            let json;
+            try { json = JSON.parse(pkt.slice(16).toString()); }
+            catch { continue; }
+
+            const name = json.vehicle_id || json.robot_id || 'UnknownRobot';
+            robotLastReceived.set(name, Date.now());
+
+            /* 위치·상태 업데이트 */
+            const pos = {
+                x: json.x ?? json.position?.x ?? 0,
+                y: json.y ?? json.position?.y ?? 0,
+                angle: json.angle ?? json.position?.yaw ?? 0
+            };
+            try {
+                await axios.post(`${CORE_URL}/api/robots`, {
+                    name,
+                    status: json.status,
+                    position: JSON.stringify(pos),
+                    additional_info: JSON.stringify(json),
+                    timestamp: new Date(),
+                    ip
+                });
+            } catch (e) { console.error('[Push] forward error:', e.message); }
+
+            /* ── task_status 처리 ─ */
+            const tStatus = json.task_status ?? json.taskStatus;
+            if (typeof tStatus === 'number') {
+                const sess = robotSessions.get(name);
+                if (!sess) continue;
+
+                if (tStatus === 4) {  // COMPLETED → 다음 목적지
+                    sess.idx += 1;
+                    const next = sess.route[sess.idx];
+                    if (next) {
+                        sendGoto(sess.socket, next, sess.route[sess.idx - 1], sess.taskId);
+                        await axios.post(`${CORE_URL}/api/robots`, {
+                            name,
+                            destination: next,
+                            status: '이동',
+                            timestamp: new Date()
+                        });
+                    } else {             // 전체 완료
+                        sess.socket.end();
+                        robotSessions.delete(name);
+                        await Promise.all([
+                            axios.post(`${CORE_URL}/api/robots`, {
+                                name,
+                                destination: null,
+                                status: '대기',
+                                timestamp: new Date()
+                            }),
+                            axios.put(`${CORE_URL}/api/tasks/${sess.taskId}`, {
+                                status: 'completed',
+                                updated_at: new Date()
+                            })
+                        ]);
+                    }
+                } else if (tStatus === 5 || tStatus === 6) { // FAILED / CANCELED
+                    sess.socket.destroy();
+                    robotSessions.delete(name);
+                    await Promise.all([
+                        axios.post(`${CORE_URL}/api/robots`, {
+                            name,
+                            status: '오류',
+                            timestamp: new Date()
+                        }),
+                        axios.put(`${CORE_URL}/api/tasks/${sess.taskId}`, {
+                            status: '오류',
+                            updated_at: new Date()
+                        })
+                    ]);
+                }
+            }
+        }
+    });
+
+    const retry = () => setTimeout(() => subscribePush(ip), 5_000);
+
+    sock.on('error', e => { console.error('[Push] error', e.message); retry(); });
+    sock.on('close', () => { console.warn('[Push] closed', ip); retry(); });
+    sock.on('timeout', () => { console.warn('[Push] timeout', ip); sock.destroy(); });
+}
+
+/* 여러 대 구독 */
+AMR_IPS.forEach(subscribePush);
+
+/* “연결 끊김” 감지 */
+setInterval(async () => {
+    const now = Date.now();
+    for (const [name, t] of robotLastReceived) {
+        if (now - t > 5_000) {
+            robotLastReceived.delete(name);
+            try {
+                await axios.post(`${CORE_URL}/api/robots`, {
+                    name,
+                    status: '연결 끊김',
+                    timestamp: new Date()
+                });
+            } catch (e) { console.error('[Push] disconnect update error:', e.message); }
+        }
+    }
+}, 1_000);
+
+/* ──────────────────────────────────────────────────────────
+   3. /api/sendTask  ― Core → ioServer
+────────────────────────────────────────────────────────── */
 
 app.post('/api/sendTask', async (req, res) => {
     const robot_ip = req.body.robot_ip || AMR_IP;
     const task = req.body.task;
-    if (!task) return res.status(400).json({ success: false, message: 'task is required' });
     const robot_name = req.body.robot_name || task.robot_name || null;
 
+    if (!task) return res.status(400).json({ success: false, message: 'task is required' });
+
+    /* 경로 스텝 추출 */
     const steps = typeof task.steps === 'string' ? JSON.parse(task.steps) : task.steps;
     const route = steps.filter(s => s.stepType === '경로').map(s => s.description);
     if (!route.length) return res.status(400).json({ success: false, message: 'no route steps' });
 
-    res.json({ success: true });                      // 즉시 OK
-    runTaskOverTcp(robot_ip, robot_name, task, route).catch(console.error);
-});
+    res.json({ success: true });   // 즉시 OK
 
-async function runTaskOverTcp(ip, robotName, task, route) {
-    const socket = net.createConnection({ host: ip, port: NAV_PORT });
-    socket.setTimeout(20000);
+    /* TCP 세션 생성 */
+    const sock = net.createConnection({ host: robot_ip, port: NAV_PORT });
+    sock.setTimeout(20_000);
 
-    let buffer = Buffer.alloc(0), idx = 0;
+    const session = { socket: sock, route, idx: 0, taskId: task.id, robotName: robot_name };
+    robotSessions.set(robot_name, session);
 
-    const sendDest = () => {
-        const dest = route[idx];
-        const serial = serialCounter = (serialCounter + 1) & 0xFFFF;
-        const payload = {
-            id: dest,
-            source_id: idx === 0 ? 'SELF_POSITION' : route[idx - 1],
-            task_id: task.id?.toString(),
-            method: 'forward',
-            skill_name: 'GotoSpecifiedPose',
-        };
-        socket.write(buildPacket(MSG_GOTARGET_ID, payload, serial));
-    };
-    sendDest();
+    sendGoto(sock, route[0], null, task.id);
 
-    socket.on('data', async chunk => {
-        buffer = Buffer.concat([buffer, chunk]);
-        while (buffer.length >= 16) {
-            const h = parseHeader(buffer.slice(0, 16));
-            if (buffer.length < 16 + h.len) break;
-            const pkt = buffer.slice(0, 16 + h.len);
-            buffer = buffer.slice(16 + h.len);
-            if (h.type !== MSG_GOTARGET_RES) continue;
-
-            const body = JSON.parse(pkt.slice(16).toString());
-            if (body.ret_code !== 0) return handleError('robot ret_code ' + body.ret_code);
-
-            /* 정상 도달 */
-            idx++;
-            const nextDest = route[idx] || null;
-            try {
-                if (robotName) {
-                    await axios.post(`${CORE_URL}/api/robots`, {
-                        name: robotName,
-                        destination: nextDest,
-                        status: nextDest ? '이동' : '대기',
-                        timestamp: new Date(),
-                    });
-                }
-                if (!nextDest) {
-                    await axios.put(`${CORE_URL}/api/tasks/${task.id}`, {
-                        status: 'completed', updated_at: new Date(),
-                    });
-                    socket.end(); return;
-                }
-            } catch (e) { return handleError('core update failed: ' + e.message); }
-            sendDest();
-        }
-    });
-
-    socket.on('error', e => handleError('TCP error: ' + e.message));
-    socket.on('timeout', () => handleError('TCP timeout'));
-
-    async function handleError(msg) {
+    const abort = async (msg) => {
         console.error('[sendTask] ' + msg);
-        socket.destroy();
+        sock.destroy();
+        robotSessions.delete(robot_name);
         try {
-            const promises = [
+            await Promise.all([
                 axios.put(`${CORE_URL}/api/tasks/${task.id}`, {
                     status: '오류', updated_at: new Date()
+                }),
+                robot_name && axios.post(`${CORE_URL}/api/robots`, {
+                    name: robot_name, status: '오류', timestamp: new Date()
                 })
-            ];
-            if (robotName) {
-                promises.unshift(
-                    axios.post(`${CORE_URL}/api/robots`, {
-                        name: robotName, status: '오류', timestamp: new Date()
-                    })
-                );
-            }
-            await Promise.all(promises);
+            ]);
         } catch (e) { console.error('[sendTask] fail to mark error:', e.message); }
-    }
-}
+    };
+
+    sock.on('error', e => abort('TCP error: ' + e.message));
+    sock.on('timeout', () => abort('TCP timeout'));
+});
 
 /* ──────────────────────────────────────────────────────────
    4. (옵션) /ello/taskstart  ― 옛 단순 배열 전송 방식
