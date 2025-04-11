@@ -214,7 +214,26 @@ app.post('/uploadMap', upload.fields([
 ────────────────────────────────────────────────────────── */
 
 const robotLastReceived = new Map();         // name -> timestamp(ms)
-const robotSessions = new Map();         // 진행중 세션(name -> {socket,route,idx,taskId,robotName})
+// 진행중 세션은 로봇의 IP를 키로 저장하도록 함 (세션 조회/삭제 시 일관성을 유지)
+const robotSessions = new Map();  // robotIp -> {socket, route, idx, taskId, robotIp, robotName, started}
+
+// ── 공통 abortTask 함수 ─────────────────────────────
+function abortTask(sess, robotName, why) {
+    console.error(`[Task ${sess.taskId}] ABORT – ${why}`);
+    if (sess.socket && !sess.socket.destroyed) {
+        sess.socket.destroy();
+    }
+    robotSessions.delete(sess.robotIp);
+    axios.post(`${CORE_URL}/api/robots`, {
+        name: robotName,
+        status: '오류',
+        timestamp: new Date()
+    }).catch(e => console.error('[Abort] robot update error:', e.message));
+    axios.put(`${CORE_URL}/api/tasks/${sess.taskId}`, {
+        status: '오류',
+        updated_at: new Date()
+    }).catch(e => console.error('[Abort] task update error:', e.message));
+}
 
 function parseHeader(buf) {
     return {
@@ -255,7 +274,7 @@ function subscribePush(ip) {
     let buffer = Buffer.alloc(0);
 
     sock.setTimeout(10_000);
-    sock.connect(PUSH_PORT, ip, () => console.log(`[Push] connected ${ip}:${PUSH_PORT}`));
+    sock.connect(PUSH_PORT, ip, () => console.log(`[Push] connected ${ip}`));
 
     sock.on('data', async chunk => {
         buffer = Buffer.concat([buffer, chunk]);
@@ -294,15 +313,36 @@ function subscribePush(ip) {
 
             /* ── task_status 처리 ─ */
             const tStatus = json.task_status ?? json.taskStatus;
+            console.log(tStatus);
             if (typeof tStatus === 'number') {
-                const sess = robotSessions.get(name);
+                const sess = robotSessions.get(ip);
                 if (!sess) continue;
+                if (!sess.robotName) sess.robotName = name;
+                // RUNNING(2) 을 처음 받으면 '시작' 플래그 켜기
+                if (tStatus === 2) {
+                    if (!sess.started) {
+                        console.log(`[Task ${sess.taskId}] ▶ RUNNING 시작`);
+                    }
+                    sess.started = true;
+                    return;          // 2는 추가 처리 없이 종료
+                }
+
+                // RUNNING 이전에 4/5/6 이 오면 무시
+                if (!sess.started) return;
 
                 if (tStatus === 4) {  // COMPLETED → 다음 목적지
                     sess.idx += 1;
                     const next = sess.route[sess.idx];
                     if (next) {
-                        sendGoto(sess.socket, next, sess.route[sess.idx - 1], sess.taskId);
+                        // 후속 명령 전송 시 새 TCP 연결 생성
+                        const newSock = net.createConnection({ host: sess.robotIp, port: NAV_PORT }, () => {
+                            sendGoto(newSock, next, sess.route[sess.idx - 1], sess.taskId);
+                            console.log(`[Task ${sess.taskId}] ▶ send GOTO ${next}`);
+                        });
+                        newSock.setTimeout(20_000);
+                        newSock.on('error', e => abortTask(sess, name, 'TCP error: ' + e.message));
+                        newSock.on('timeout', () => abortTask(sess, name, 'TCP timeout'));
+                        sess.socket = newSock;  // 세션의 소켓 갱신
                         await axios.post(`${CORE_URL}/api/robots`, {
                             name,
                             destination: next,
@@ -310,8 +350,9 @@ function subscribePush(ip) {
                             timestamp: new Date()
                         });
                     } else {             // 전체 완료
-                        sess.socket.end();
-                        robotSessions.delete(name);
+                        console.log(`[Task ${sess.taskId}] ★ ALL DESTINATIONS DONE`);
+                        if (sess.socket && !sess.socket.destroyed) sess.socket.end();
+                        robotSessions.delete(sess.robotIp);
                         await Promise.all([
                             axios.post(`${CORE_URL}/api/robots`, {
                                 name,
@@ -326,8 +367,8 @@ function subscribePush(ip) {
                         ]);
                     }
                 } else if (tStatus === 5 || tStatus === 6) { // FAILED / CANCELED
-                    sess.socket.destroy();
-                    robotSessions.delete(name);
+                    if (sess.socket && !sess.socket.destroyed) sess.socket.destroy();
+                    robotSessions.delete(sess.robotIp);
                     await Promise.all([
                         axios.post(`${CORE_URL}/api/robots`, {
                             name,
@@ -380,42 +421,48 @@ app.post('/api/sendTask', async (req, res) => {
     const task = req.body.task;
     const robot_name = req.body.robot_name || task.robot_name || null;
 
-    if (!task) return res.status(400).json({ success: false, message: 'task is required' });
-
+    if (!task) {
+        console.error('[sendTask] no task in body');
+        return res.status(400).json({ success: false, message: 'task is required' });
+    }
     /* 경로 스텝 추출 */
     const steps = typeof task.steps === 'string' ? JSON.parse(task.steps) : task.steps;
     const route = steps.filter(s => s.stepType === '경로').map(s => s.description);
-    if (!route.length) return res.status(400).json({ success: false, message: 'no route steps' });
 
+    if (!route.length) {
+        console.error('[sendTask] no route steps');
+        return res.status(400).json({ success: false, message: 'no route steps' });
+    }
     res.json({ success: true });   // 즉시 OK
 
     /* TCP 세션 생성 */
     const sock = net.createConnection({ host: robot_ip, port: NAV_PORT });
     sock.setTimeout(20_000);
 
-    const session = { socket: sock, route, idx: 0, taskId: task.id, robotName: robot_name };
-    robotSessions.set(robot_name, session);
-
-    sendGoto(sock, route[0], null, task.id);
-
-    const abort = async (msg) => {
-        console.error('[sendTask] ' + msg);
-        sock.destroy();
-        robotSessions.delete(robot_name);
-        try {
-            await Promise.all([
-                axios.put(`${CORE_URL}/api/tasks/${task.id}`, {
-                    status: '오류', updated_at: new Date()
-                }),
-                robot_name && axios.post(`${CORE_URL}/api/robots`, {
-                    name: robot_name, status: '오류', timestamp: new Date()
-                })
-            ]);
-        } catch (e) { console.error('[sendTask] fail to mark error:', e.message); }
+    const session = {
+        socket: sock,
+        route,
+        idx: 0,
+        taskId: task.id,
+        robotIp: robot_ip,
+        robotName: robot_name,
+        started: false
     };
+    // 세션의 키로 로봇 IP를 사용 (일관성 유지)
+    robotSessions.set(robot_ip, session);
 
-    sock.on('error', e => abort('TCP error: ' + e.message));
-    sock.on('timeout', () => abort('TCP timeout'));
+    console.log(`\n=== [Task ${task.id}] START ===`);
+    console.log('robot_ip   :', robot_ip);
+    console.log('robot_name :', robot_name);
+    console.log('route      :', route);
+
+    sock.on('error', e => abortTask(session, robot_name, 'TCP error: ' + e.message));
+    sock.on('timeout', () => abortTask(session, robot_name, 'TCP timeout'));
+
+    sock.on('connect', () => {
+        sendGoto(sock, route[0], null, task.id);
+        console.log(`[Task ${task.id}] ▶ first GOTO sent: ${route[0]}`);
+    });
 });
 
 /* ──────────────────────────────────────────────────────────
@@ -490,7 +537,6 @@ app.get('/api/robot/:name/maps', async (req, res) => {
         return res.status(500).json({ success: false, message: e.message });
     }
 });
-
 
 /* ──────────────────────────────────────────────────────────
    5. Socket.IO & HTTP 서버 구동
